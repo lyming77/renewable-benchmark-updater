@@ -16,7 +16,8 @@ _LABELS = {
     "candidates": "候选匹配记录", "original": "原报内容", "unit": "来源单位",
 }
 _KINDS = {"added_record": "新增记录", "filled_empty": "补充空值",
-          "overwritten_conflict": "按新值更新", "verified_summary_price": "核实后修正均价"}
+          "overwritten_conflict": "按新值更新", "verified_summary_price": "核实后修正均价",
+          "normalized_format": "统一日期格式"}
 
 
 def _text(value):

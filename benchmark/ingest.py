@@ -98,11 +98,20 @@ def _issue(code, message, *, record=None, field=None, severity='warning', **deta
 
 
 def _date(value):
-    if isinstance(value, (datetime, date)):
+    # Only an explicit date or a midnight serialization of one is a format
+    # alias. Do not swallow appended remarks, times or timezone conversions.
+    if isinstance(value, datetime):
+        if any((value.hour, value.minute, value.second, value.microsecond)):
+            return None
+        return value.strftime('%Y-%m-%d')
+    if isinstance(value, date):
         return value.strftime('%Y-%m-%d')
     if not isinstance(value, str):
         return None
-    match = re.fullmatch(r'\s*(20\d{2}|19\d{2})[-./年](\d{1,2})[-./月](\d{1,2})(?:日|(?:[ T].*)?)?\s*', value)
+    text = unicodedata.normalize('NFKC', value).strip()
+    match = re.fullmatch(
+        r'(20\d{2}|19\d{2})[-./年](\d{1,2})[-./月](\d{1,2})日?'
+        r'(?:[ T]00:00(?::00(?:\.0+)?)?(?:Z|\+00:00)?)?', text)
     if match:
         try:
             return date(*(int(x) for x in match.groups())).isoformat()
@@ -315,6 +324,7 @@ def _read_sheet(sheet, filename, headers, year, *, collection):
             current_year = year
             continue
         values = [None] * 71
+        cell_normalizations = []
         capacity_cell_unit = None
         cells, states, originals, merged_numeric = {}, {str(j): 'absent' for j in range(71)}, {}, []
         for c, j in mapping.items():
@@ -354,6 +364,9 @@ def _read_sheet(sheet, filename, headers, year, *, collection):
                         # Preserve the old analysis cell's exact observation;
                         # compare date semantics during merge instead.
                         if collection:
+                            if value != parsed:
+                                cell_normalizations.append({'field_index': 7, 'before': value, 'after': parsed,
+                                    'reason': '明确投产日期按YYYY-MM-DD归一，未改变日历日期。'})
                             value = parsed
                     elif not is_blank(value):
                         originals['7'] = value
@@ -384,6 +397,7 @@ def _read_sheet(sheet, filename, headers, year, *, collection):
                'source_cells': cells, 'company': co, 'month': current_month, 'year': current_year,
                'present_fields': sorted(set(mapping.values())), 'field_states': states,
                'original_errors': originals, 'merged_numeric_fields': merged_numeric,
+               'normalizations': cell_normalizations,
                'provenance': [{'source': filename, 'sheet': sheet['name'], 'row': rn}],
                'record_id': sha256(f'{filename}|{sheet["name"]}|{rn}'.encode()).hexdigest()[:24]}
         if collection:
@@ -532,6 +546,29 @@ def merge_records(old_records, new_records, conflict_policy='keep_old') -> dict:
     changes, issues, quarantined = [], [], []
     new_field_origins = {}
     stats = Counter({'old_records': len(records), 'incoming_records': len(incoming)})
+
+    # Field labels used by the pivot must use the same representation across
+    # the entire old+new timeline, including newly appended months. Merely
+    # recognizing two date formats as equal while matching old months leaves
+    # the new month as a false classification change in the native cache.
+    for origin, rr in [('old', records), ('new', incoming)]:
+        for rec in rr:
+            before = rec['values'][7]
+            canonical = _date(before)
+            if canonical is None or before == canonical:
+                continue
+            rec['values'][7] = canonical
+            normalization = {'field_index': 7, 'before': before, 'after': canonical,
+                             'reason': '明确投产日期统一为YYYY-MM-DD；仅规范格式，未改变日历日期或分期。'}
+            rec.setdefault('normalizations', []).append(normalization)
+            rec.setdefault('original_classification_values', {}).setdefault('7', before)
+            changes.append({'kind': 'normalized_format', 'record_id': rec.get('record_id'),
+                            'company': rec['company'], 'month': rec['month'], 'year': rec.get('year'),
+                            'station': rec['values'][2] or rec['values'][3], 'field_index': 7, 'field': HEADERS[7],
+                            'before': before, 'after': canonical, 'old_source': _source(rec), 'new_source': _source(rec),
+                            'source_cell': rec.get('source_cells', {}).get('7'), 'reason': normalization['reason'],
+                            'normalization_origin': origin})
+            stats['normalized_format_cells'] += 1
 
     def base_key(r):
         return (normalize_text(r['company']), r.get('year'), r.get('month'), normalize_text(r['values'][2] or r['values'][3]))

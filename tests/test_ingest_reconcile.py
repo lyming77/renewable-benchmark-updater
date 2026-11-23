@@ -91,6 +91,12 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(result['records'][0]['values'][7], 2010)
         self.assertEqual(result['records'][1]['values'][7], b['values'][7])
 
+    def test_collection_keeps_commission_date_remarks_instead_of_truncating(self):
+        r = record(date='2024-06-30 待核实分期')
+        result = read_collection(workbook([('测试公司', {4: HEADERS, 5: r['values'][:67]}, [])]), '2026_new.xlsx', HEADERS, 2026)
+        self.assertEqual(result['records'][0]['values'][7], r['values'][7])
+        self.assertEqual(result['records'][0]['field_states']['7'], 'unstructured_date')
+
     def test_variable_column_count_and_explicit_capacity_unit(self):
         indexes = list(range(1, 67)); indexes.remove(66)
         headers = [HEADERS[i] for i in indexes]
@@ -167,6 +173,36 @@ class IngestionTests(unittest.TestCase):
 
 
 class MergeTests(unittest.TestCase):
+    def test_commission_date_formats_canonicalize_whole_timeline_in_both_modes(self):
+        old = record(date='2024-06-30T00:00:00.000Z')
+        following = record(month=2, source='new.xlsx', date='2024-06-30')
+        for mode in ('keep_old', 'prefer_new'):
+            result = merge_records([old], [following], mode)
+            self.assertEqual([r['values'][7] for r in result['records']], ['2024-06-30'] * 2)
+            from benchmark.hours import build_hours_model
+            self.assertEqual(build_hours_model(result['records'], HEADERS, year=2026)['metadata']['special_unit_count'], 0)
+            change = next(c for c in result['changes'] if c['kind'] == 'normalized_format')
+            self.assertEqual(change['before'], '2024-06-30T00:00:00.000Z')
+            self.assertEqual(change['after'], '2024-06-30')
+            self.assertEqual(result['records'][0]['original_classification_values']['7'], old['values'][7])
+            again = merge_records(result['records'], [], mode)
+            self.assertFalse(again['changes'])
+        self.assertEqual(old['values'][7], '2024-06-30T00:00:00.000Z')
+
+    def test_date_normalization_retains_real_date_changes_remarks_and_partial_years(self):
+        samples = ['2024-06-30 待核实', '一期2024.6.30；二期2025.1.1', 2024,
+                   '2024-06-30T12:00:00Z', '2024-06-30T00:00:00+08:00']
+        for raw in samples:
+            r = record(date=raw)
+            result = merge_records([r], [])
+            self.assertEqual(result['records'][0]['values'][7], raw)
+            self.assertFalse(result['changes'])
+        old = record(date='2024-06-30T00:00:00.000Z')
+        new = record(source='new.xlsx', date='2024-07-01')
+        self.assertEqual(merge_records([old], [new])['records'][0]['values'][7], '2024-06-30')
+        self.assertEqual(merge_records([old], [new], 'prefer_new')['records'][0]['values'][7], '2024-07-01')
+        self.assertTrue(any(x.get('field_index') == 7 for x in merge_records([old], [new])['issues']))
+
     def test_fill_zero_keep_old_and_report_two_new_sources(self):
         old = record(); old['values'][20] = None; old['values'][22] = 7
         a = record(source='a.xlsx'); a['values'][20] = 0; a['values'][22] = 8
