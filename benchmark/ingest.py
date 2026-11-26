@@ -30,6 +30,7 @@ HEADERS = [
     '跨月追退补结算电费', '清算费用', '总结算电量', '总结算电价', '总结算电费', '机制电量', '机制电费', '国补电量', '国补电费', '集团',
 ]
 EXTRA_HEADERS = {67: '利用小时数', 68: '存量增量', 69: '退补调整分配费用', 70: '数据核对说明'}
+RETRO_FEE_NOT_IN_SOURCE = '来源未单列退补调整分配费用'
 S = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
 IDENTITY_FIELDS = {1, 2, 3, 4, 5, 7, 66, 68}
@@ -393,9 +394,13 @@ def _read_sheet(sheet, filename, headers, year, *, collection):
         co = str(values[66]).strip() if not is_blank(values[66]) else sheet['name'] if collection and not re.fullmatch(r'(?:sheet\d*|汇总|明细|分析表|收集表)', sheet['name'], re.I) else None
         if co:
             co = COMPANY_ALIASES.get(co, co)
+        present = set(mapping.values())
+        if not collection and is_blank(values[69]) and RETRO_FEE_NOT_IN_SOURCE in str(values[70] or '').split('；'):
+            present.discard(69)
+            states['69'] = 'absent'
         rec = {'values': values, 'source': filename, 'sheet': sheet['name'], 'source_row': rn,
                'source_cells': cells, 'company': co, 'month': current_month, 'year': current_year,
-               'present_fields': sorted(set(mapping.values())), 'field_states': states,
+               'present_fields': sorted(present), 'field_states': states,
                'original_errors': originals, 'merged_numeric_fields': merged_numeric,
                'normalizations': cell_normalizations,
                'provenance': [{'source': filename, 'sheet': sheet['name'], 'row': rn}],
@@ -770,7 +775,19 @@ def merge_records(old_records, new_records, conflict_policy='keep_old') -> dict:
             old.setdefault('field_states', {})[str(j)] = new.get('field_states', {}).get(str(j), 'present')
             old.setdefault('source_cells', {})[str(j)] = new.get('source_cells', {}).get(str(j))
             old.setdefault('field_provenance', {})[str(j)] = _source(new)
-        old['present_fields'] = sorted(set(old.get('present_fields', [])) | set(new.get('present_fields', [])))
+        reported_fields = set(old.get('present_fields', [])) | set(new.get('present_fields', []))
+        if is_blank(old['values'][69]):
+            # A composite analysis header alone cannot prove that this source
+            # row had a separate retroactive allocation column.
+            states = old.setdefault('field_states', {})
+            incoming_state = new.get('field_states', {}).get('69', 'unknown')
+            if 69 in new.get('present_fields', []):
+                if states.get('69') in (None, 'absent', 'blank') and incoming_state != 'unknown':
+                    states['69'] = incoming_state
+            elif old['values'][0] == new['values'][0] and incoming_state == 'absent' and states.get('69') == 'blank':
+                states['69'] = 'absent'
+                reported_fields.discard(69)
+        old['present_fields'] = sorted(reported_fields)
         old.setdefault('provenance', [_source(old)])
         if _source(new) not in old['provenance']:
             old['provenance'].append(_source(new))

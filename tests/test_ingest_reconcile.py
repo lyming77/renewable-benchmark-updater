@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmark.ingest import HEADERS, EXTRA_HEADERS, read_analysis, read_collection, merge_records
+from benchmark.ingest import HEADERS, EXTRA_HEADERS, RETRO_FEE_NOT_IN_SOURCE, read_analysis, read_collection, merge_records
 from benchmark.reconcile import QUANTITY_FIELDS, FEE_FIELDS, reconcile_records
 
 NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
@@ -74,6 +74,14 @@ def record(station='测试甲', month=1, source='old.xlsx', date=None):
 
 
 class IngestionTests(unittest.TestCase):
+    def test_source_column_absence_survives_shared_analysis_header(self):
+        row = record()
+        row['values'][70] = '旧注；' + RETRO_FEE_NOT_IN_SOURCE
+        raw = workbook([('Sheet2', {4: HEADERS + list(EXTRA_HEADERS.values()), 5: row['values']}, [])])
+        parsed = read_analysis(raw, '2026旧表.xlsx')['records'][0]
+        self.assertNotIn(69, parsed['present_fields'])
+        self.assertNotIn(69, reconcile_records([parsed])['records'][0]['reconciliation']['fee_missing'])
+
     def test_analysis_preserves_71_columns_and_original_provenance(self):
         r = record(); r['values'][68:71] = ['存量', -3.25, '保留的历史核对备注']
         headers = HEADERS + [EXTRA_HEADERS[i] for i in range(67, 71)]

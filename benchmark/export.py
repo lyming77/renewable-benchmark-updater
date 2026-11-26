@@ -13,6 +13,7 @@ import posixpath
 import re
 from xml.etree import ElementTree as ET
 
+from .ingest import RETRO_FEE_NOT_IN_SOURCE
 from .native import (
     CT, NS, PKGREL, REL, X14, ExportError, Package, arithmetic, cell, col,
     colnum, key, local, logical, parse, pivot_rebuild, rebuild_cache,
@@ -192,12 +193,16 @@ def _write_details(pkg, part, records):
         raise ExportError("Sheet2存在跨数据行的合并单元格，无法安全重建。")
     for number, record in enumerate(records, 5):
         values = list(record["values"][:71]); values += [None] * (71 - len(values))
-        notes = record.get("notes", [])
+        raw_notes = record.get("notes") or []
+        notes = list(raw_notes) if isinstance(raw_notes, (list, tuple)) else [str(raw_notes)]
+        existing = str(values[70]).split("；") if values[70] is not None else []
+        existing = [item for item in existing if item != RETRO_FEE_NOT_IN_SOURCE]
+        if values[69] is None and record.get("field_states", {}).get("69") == "absent":
+            notes.append(RETRO_FEE_NOT_IN_SOURCE)
         if notes:
-            existing = str(values[70]) if values[70] is not None else ""
-            items = [str(n) for n in notes] if isinstance(notes, (list, tuple)) else [str(notes)]
-            additions = [n for n in dict.fromkeys(items) if n and n not in existing]
-            values[70] = "；".join(s for s in [existing] + additions if s)
+            previous = "；".join(existing)
+            existing.extend(note for note in dict.fromkeys(map(str, notes)) if note and note not in previous)
+        values[70] = "；".join(existing) or None
         energy, capacity = values[20], values[6]
         hours = energy / capacity if isinstance(energy, (int, float)) and not isinstance(energy, bool) and isinstance(capacity, (int, float)) and capacity > 0 else None
         values[67] = hours
