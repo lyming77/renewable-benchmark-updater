@@ -121,12 +121,12 @@ if result is not None:
             visible = result.issues if show_info else pending
             st.dataframe(pd.DataFrame(readable_rows([audit_row(row, "待核对", result.headers) for row in visible])),
                          hide_index=True, width="stretch")
-            st.caption("相应来源、原值、差额和处理方式也会写入下载文件的本次更新记录。")
+            st.caption("下载文件的「汇总勾稽」逐行列出分项合计、量费差额及原均价交叉验证。")
         else:
             st.write("本次未发现待核对事项。")
 
 with st.expander("处理口径与后续更新"):
-    st.write("按公司、月份、场站及明确分期信息匹配记录。默认补空缺并保留已有数值，冲突逐项记录。容量只有在来源单位明确时自动换算为 MW。")
+    st.write("按公司、月份、场站及明确分期信息匹配记录。默认补空缺并保留已有数值，冲突逐项记录。容量统一为 MW，来源单位有疑问时结合相同场站的历史容量和实际上网电量验证。")
     st.write("量价费核验会分别列出电量组成、电费组成和差额。只有总量、总费均有充分证据时，才据此修正错误价格；其他差异保留待核对。")
-    st.write("每次生成都会重建利用小时辅助列和月份控制行，支持新增月份和场站。原工作簿历史审计页作为旧版本快照保留，请以本次更新记录查看本轮处理。")
+    st.write("每次生成都会重建利用小时辅助列、月份控制行和「汇总勾稽」。逐项变更及其来源见「本次更新记录」。")
     st.write("目前接收同一年度数据。原生 WPS 透视字段数量有限，若新增分类变化导致字段超限，程序会说明原因并停止生成。")

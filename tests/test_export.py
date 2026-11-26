@@ -72,6 +72,23 @@ def synthetic_template():
 
 
 class ExportTests(unittest.TestCase):
+    def test_reconciliation_sheet_updates_when_template_is_reused(self):
+        from benchmark.reconcile import reconcile_records
+
+        template = synthetic_template()
+        source = synthetic_records()
+        for record, month in zip(source, (1, 3)):
+            record.update(month=month, company='合成集团', year=2026)
+        records = reconcile_records(source)['records']
+        model = build_hours_model(records, synthetic_headers())
+        for template_source in (template, generate_workbook(template, records, model, [])):
+            pkg = Package(generate_workbook(template_source, records, model, []))
+            sheets = pkg.sheets()
+            sheet = pkg.root(sheets['汇总勾稽'])
+            self.assertIn('汇总勾稽_历史', sheets)
+            self.assertEqual(sheet.find(tag('autoFilter')).get('ref'), 'A6:X8')
+            self.assertEqual(pkg.read(sheets['汇总勾稽_历史']), Package(template).read('xl/worksheets/sheet4.xml'))
+
     def test_rebuilds_both_caches_and_preserves_history(self):
         template=synthetic_template();records=synthetic_records();model=build_hours_model(records,synthetic_headers())
         self.assertTrue(validate_template(template)["compatible"])

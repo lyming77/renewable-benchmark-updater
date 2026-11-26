@@ -1,10 +1,10 @@
 """Read-only XLSX ingestion and conservative, provenance-preserving merging.
 
-This module does not write workbooks, evaluate uploaded formulas, or infer
-company-specific corrections from the historical example data.
+This module does not write workbooks or evaluate uploaded formulas.
 """
 from __future__ import annotations
 
+from calendar import monthrange
 from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import date, datetime, timedelta
@@ -421,10 +421,12 @@ def _read_sheet(sheet, filename, headers, year, *, collection):
             c = next((c for c, j in mapping.items() if j == 6), None)
             unittext = capacity_cell_unit or raw_headers.get(c, '')
             factor, unit = _capacity_unit(unittext)
+            rec['capacity_unit_label'] = unittext
+            rec['capacity_unit_factor'] = factor
             if factor is None:
                 originals['6'] = values[6]
                 values[6], states['6'] = None, 'ambiguous_unit'
-                warnings.append(_issue('capacity_energy_unit', '装机容量标题使用电量单位，无法可靠换算为MW；保留原数并待确认。', record=rec, field=6, original=originals['6'], original_unit=unittext))
+                warnings.append(_issue('capacity_energy_unit', '装机容量标成电量单位，需通过同场站历史容量和实际上网电量复核。', record=rec, field=6, original=originals['6'], unit=unittext))
             else:
                 if factor != 1:
                     old = values[6]
@@ -483,7 +485,7 @@ def read_collection(data: bytes, filename: str, headers: list[str], year: int) -
         raise ValueError(f'上传文件名标注{named_year}年，与所选{year}年不一致；请分年度处理。')
     records, warnings, layouts = [], [], []
     for sheet in _xlsx(data, filename):
-        if sheet['name'] in ('小时联动源', '期间场站汇总') or any(
+        if sheet['name'] in ('小时联动源', '期间场站汇总', '汇总勾稽', '汇总勾稽_历史') or sheet['name'].startswith('本次更新记录') or any(
             {_header(v) for v in row.values()} >= {_header('记录用途'), _header('小时源变更')}
             for r, row in sheet['rows'].items() if r <= 30
         ):
@@ -534,6 +536,93 @@ def _financial_signature(record):
     return tuple(nonzero) if len(nonzero) >= 6 else None
 
 
+def _capacity_identity(record):
+    v = record['values']
+    # Reporting regions can change across versions for the same settlement unit.
+    # Keep commissioning and dispatch data to distinguish genuinely separate phases.
+    return (normalize_text(record['company']), record['year'], normalize_text(v[2]), normalize_text(v[3]),
+            normalize_text(v[5]), normalize_text(v[7]))
+
+
+def _maximum_hours(record):
+    year, month = record['year'], record['month']
+    if isinstance(year, int) and isinstance(month, int) and 1 <= month <= 12:
+        return monthrange(year, month)[1] * 24
+    return None
+
+
+def _capacity_observation(record):
+    v = record['values']
+    return (record.get('original_errors', {}).get('6')
+            if record.get('field_states', {}).get('6') == 'ambiguous_unit' else v[6])
+
+
+def _correct_capacity_units(previous, incoming):
+    """Check a tenfold source scale against independent months and physical output."""
+    history = defaultdict(list)
+    for record in previous:
+        capacity, energy = record['values'][6], record['values'][20]
+        hours = _maximum_hours(record)
+        if (hours and is_number(capacity) and capacity > 0 and is_number(energy)
+                and 0 < energy <= capacity * hours * 1.01):
+            history[_capacity_identity(record)].append(record)
+    changes = []
+    for records in (previous, incoming):
+        candidates = []
+        groups = defaultdict(set)
+        corroborating = defaultdict(set)
+        for record in records:
+            raw = _capacity_observation(record)
+            hours = _maximum_hours(record)
+            identity = _capacity_identity(record)
+            if not hours or not (identity[2] or identity[3]) or not is_number(raw) or raw <= 0:
+                continue
+            group = (identity[:2], record['month'], record.get('source'), record.get('sheet'))
+            groups[group].add(identity)
+            if record.get('capacity_unit_factor', 1) not in (None, 1):
+                continue  # The parser already applied an explicit power unit.
+            refs = [ref for ref in history[identity] if ref['month'] != record['month']]
+            month_counts = Counter(ref['month'] for ref in refs)
+            if len(month_counts) < 2 or max(month_counts.values()) > 1:
+                continue
+            expected = refs[0]['values'][6]
+            if not _equivalent(expected, raw * 10, 6) or any(
+                not _equivalent(ref['values'][6], expected, 6) for ref in refs
+            ):
+                continue
+            energy = record['values'][20]
+            if is_number(energy) and energy > expected * hours * 1.01:
+                continue
+            impossible_in_mw = is_number(energy) and energy > raw * hours * 1.01
+            if impossible_in_mw:
+                corroborating[group].add(identity)
+            candidates.append((record, identity, group, raw, expected, refs, impossible_in_mw))
+
+        for record, identity, group, raw, expected, refs, impossible_in_mw in candidates:
+            # A repeat pattern in the same source block can establish the scale
+            # even if a particular station had low production that month.
+            witnesses = len(corroborating[group] - {identity})
+            cohort_confirms_scale = witnesses >= 3 and witnesses * 2 >= len(groups[group])
+            if not impossible_in_mw and not cohort_confirms_scale:
+                continue
+            months = sorted({r['month'] for r in refs})
+            months_label = '、'.join(map(str, months))
+            evidence = ('原值按MW计算会超过当月日历小时' if impossible_in_mw else
+                        f'同一来源中另有{witnesses}个场站满足相同的十倍差异和发电量验证')
+            reason = f'同场站历史（{months_label}月）装机为{expected:g} MW，且{evidence}，按万千瓦×10换算为MW。'
+            record['values'][6] = expected
+            record.setdefault('field_states', {})['6'] = 'capacity_unit_verified'
+            record.setdefault('notes', []).append(f'装机容量{raw:g}→{expected:g} MW。{reason}')
+            changes.append({'kind': 'capacity_unit_corrected', 'record_id': record.get('record_id'),
+                            'company': record['company'], 'month': record['month'], 'year': record['year'],
+                            'station': record['values'][2] or record['values'][3],
+                            'field_index': 6, 'field': HEADERS[6], 'before': raw, 'after': expected,
+                            'old_source': _source(record), 'new_source': [_source(ref) for ref in refs],
+                            'source_cell': record.get('source_cells', {}).get('6'),
+                            'unit': record.get('capacity_unit_label'), 'reason': reason})
+    return changes
+
+
 def merge_records(old_records, new_records, conflict_policy='keep_old') -> dict:
     """Fill missing observations; retain every disputed value and its origin."""
     if conflict_policy not in ('keep_old', 'prefer_new'):
@@ -569,6 +658,10 @@ def merge_records(old_records, new_records, conflict_policy='keep_old') -> dict:
                             'source_cell': rec.get('source_cells', {}).get('7'), 'reason': normalization['reason'],
                             'normalization_origin': origin})
             stats['normalized_format_cells'] += 1
+
+    capacity_changes = _correct_capacity_units(records, incoming)
+    changes.extend(capacity_changes)
+    stats['corrected_capacity_observations'] = len(capacity_changes)
 
     def base_key(r):
         return (normalize_text(r['company']), r.get('year'), r.get('month'), normalize_text(r['values'][2] or r['values'][3]))

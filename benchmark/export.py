@@ -18,6 +18,7 @@ from .native import (
     colnum, key, local, logical, parse, pivot_rebuild, rebuild_cache,
     rebuild_slicer, relpath, resolve, scalar, shared_strings, tag, value, global_formats_only,
 )
+from .reporting import RECONCILIATION_HEADERS, reconciliation_rows
 
 __all__ = ["generate_workbook", "validate_template", "ExportError"]
 
@@ -222,14 +223,17 @@ def _write_details(pkg, part, records):
     pkg.write(part, root)
 
 
-def _plain_sheet(headers, rows, title, notice, number_style=None):
+def _plain_sheet(headers, rows, title, notice, number_style=None, *, method=None, freeze_columns=0):
     root = ET.Element(tag("worksheet")); views = ET.SubElement(root, tag("sheetViews"))
     view = ET.SubElement(views, tag("sheetView"), {"workbookViewId": "0"})
-    ET.SubElement(view, tag("pane"), {"ySplit": "6", "topLeftCell": "A7", "activePane": "bottomLeft", "state": "frozen"})
+    pane = {"ySplit": "6", "topLeftCell": "A7", "activePane": "bottomLeft", "state": "frozen"}
+    if freeze_columns:
+        pane.update({"xSplit": str(freeze_columns), "topLeftCell": f"{col(freeze_columns+1)}7", "activePane": "bottomRight"})
+    ET.SubElement(view, tag("pane"), pane)
     columns = ET.SubElement(root, tag("cols"))
     ET.SubElement(columns, tag("col"), {"min": "1", "max": str(len(headers)), "width": "18", "customWidth": "1"})
     data = ET.SubElement(root, tag("sheetData"))
-    for n, text in ((1, title), (2, notice), (3, "新增或修改明细后，请重新上传云端生成；仅在本文件内编辑不会重建完整样本及分类辅助源。")):
+    for n, text in ((1, title), (2, notice), (3, method or "新增或修改明细后，请重新上传云端生成；仅在本文件内编辑不会重建完整样本及分类辅助源。")):
         ET.SubElement(data, tag("row"), {"r": str(n)}).append(cell(f"A{n}", text))
     row = ET.SubElement(data, tag("row"), {"r": "6"})
     for i, header in enumerate(headers, 1):
@@ -361,8 +365,13 @@ def _generate(template_bytes, records, hours_model, audit_rows, year):
     end = lambda info: int(re.search(r"\d+$", info["root"].find(tag("location")).get("ref")).group())
     _patch_pivot_cells(view, 3, end(main), groups, [d.get("name") for d in pkg.root(main["part"]).find(tag("dataFields"))], main_metrics, shared)
     _patch_pivot_cells(view, lower_start, end(lower), dispatches, ["求和项:实际上网电量"], lambda group: [sum(dispatch_sums.values()) if group == "__all__" else dispatch_sums[group]], shared)
+    existing = pkg.sheets()
+    audit_name, suffix = "本次更新记录", 2
+    while audit_name in existing:
+        audit_name = f"本次更新记录{suffix}"
+        suffix += 1
     data = view.find(tag("sheetData")); rowmap = {int(r.get("r")): r for r in data}
-    for n, text in ((1, f"{year}年新能源交易对标（本次上传重建）"), (2, "月份/类型/集团可多选。新增或修改明细后，请重新上传云端生成；旧审计表为上传版本的历史快照。")):
+    for n, text in ((1, f"{year}年新能源交易对标（本次上传重建）"), (2, f"月份/类型/集团可多选。查看「汇总勾稽」核对量价费，「{audit_name}」查看容量换算等变更。")):
         row = rowmap.get(n)
         if row is None: row = ET.SubElement(data, tag("row"), {"r": str(n)})
         for c in list(row):
@@ -381,20 +390,53 @@ def _generate(template_bytes, records, hours_model, audit_rows, year):
     views = wb.find(tag("bookViews"))
     if views is not None and len(views): views[0].set("activeTab", str(list(pkg.sheets()).index("Sheet5")))
     pkg.write("xl/workbook.xml", wb)
-    existing = pkg.sheets(); audit_name = "本次更新记录"; suffix = 2
-    while audit_name in existing:
-        audit_name = f"本次更新记录{suffix}"; suffix += 1
+    _write_reconciliation(pkg, records, year)
     audit_part = _add_sheet(pkg, audit_name)
     audit_headers = list(dict.fromkeys(k for r in audit_rows for k in r)) or ["说明"]
     audit_values = [[_audit_value(r.get(k)) for k in audit_headers] for r in audit_rows]
     if not audit_values: audit_values = [["本次未报告逐项差异或问题。"]]
-    audit = _plain_sheet(audit_headers, audit_values, "本次更新记录", f"本轮年份{year}；明细{len(records)}条。原Sheet1及汇总勾稽截至上传旧版本，本页记录本轮变更及问题。")
+    audit = _plain_sheet(audit_headers, audit_values, "本次更新记录", f"{year}年明细{len(records)}条。本页列出逐项变更及问题。所有记录的量价费核验见「汇总勾稽」。")
     _style_update_sheet(pkg, audit, audit_headers, audit_values)
     pkg.write(audit_part, audit)
     # An old calcChain may reference rows removed during a rebuild. Remove it
     # and its relationship/override; applications rebuild calculation order.
     _remove_calc_chain(pkg)
     return pkg.finish()
+
+
+def _write_reconciliation(pkg, records, year):
+    rows = list(reconciliation_rows(records))
+    if not rows:
+        return
+    name, historical_name = "汇总勾稽", "汇总勾稽_历史"
+    sheets = pkg.sheets()
+    part = sheets.get(name)
+    if part and historical_name not in sheets:
+        existing = pkg.root(part).find(f"{tag('sheetData')}/{tag('row')}/{tag('c')}[@r='A1']")
+        title = value(existing, shared_strings(pkg)) if existing is not None else ""
+        if not str(title).endswith("年总结算组成勾稽"):
+            wb = pkg.root("xl/workbook.xml")
+            wb.find(f"{tag('sheets')}/{tag('sheet')}[@name='{name}']").set("name", historical_name)
+            for defined in wb.findall(f"{tag('definedNames')}/{tag('definedName')}"):
+                formula = defined.text or ""
+                if formula.startswith((f"{name}!", f"'{name}'!")):
+                    defined.text = f"'{historical_name}'!" + formula.split("!", 1)[1]
+            pkg.write("xl/workbook.xml", wb)
+            part = None
+    part = part or _add_sheet(pkg, name)
+    months = sorted({row[1] for row in rows})
+    months_label = "、".join(map(str, months))
+    verified = sum(bool(r["reconciliation"]["totals_verified"]) for r in records if "reconciliation" in r)
+    corrected = sum(bool(r["reconciliation"]["price_corrected"]) for r in records if "reconciliation" in r)
+    sheet = _plain_sheet(
+        RECONCILIATION_HEADERS, rows, f"{year}年总结算组成勾稽",
+        f"月份 {months_label}｜逐行核验 {len(rows):,} 条｜量费独立对平且分项完整 {verified:,} 条｜本次重算均价 {corrected:,} 条。A列对应Sheet2行号。",
+        method="电量按实时＋月末＋跨月及独立省间、非市场、调试量核对。电费按各分项原符号加总，含另列退补分配，机制费及国补费单列。差额＝报送值减已列合计，空白项未按零认证。",
+        freeze_columns=4,
+    )
+    widths = [12, 9, 14, 24, 21, 22, 22, 24, 22, 24, 20, 24, 24, 26, 20, 24, 24, 26, 24, 24, 56, 44, 58, 55]
+    _style_update_sheet(pkg, sheet, RECONCILIATION_HEADERS, rows, widths=widths)
+    pkg.write(part, sheet)
 
 
 def _audit_value(item):
@@ -404,8 +446,8 @@ def _audit_value(item):
     return scalar(item)
 
 
-def _style_update_sheet(pkg, sheet, headers, values):
-    """Append styles; touch only the newly added update log's layout."""
+def _style_update_sheet(pkg, sheet, headers, values, *, widths=None):
+    """Apply styles to the generated audit sheet."""
     import unicodedata
     root = pkg.root("xl/styles.xml")
     order = ["numFmts", "fonts", "fills", "borders", "cellStyleXfs", "cellXfs", "cellStyles", "dxfs", "tableStyles", "colors", "extLst"]
@@ -441,10 +483,11 @@ def _style_update_sheet(pkg, sheet, headers, values):
         xf = ET.SubElement(xfs, tag("xf"), {"numFmtId": "0", "fontId": str(font_id if is_header else 0), "fillId": str(fill_id if is_header else 0), "borderId": "0", "xfId": "0", "applyAlignment": "1", "applyFont": "1", "applyFill": "1"})
         ET.SubElement(xf, tag("alignment"), {"vertical": "top", "wrapText": "1"})
     xfs.set("count", str(len(xfs))); pkg.write("xl/styles.xml", root)
-    widths = []
-    for header in headers:
-        name = str(header)
-        widths.append(65 if "核对明细" in name else 56 if "说明" in name else 24 if "单元格" in name else 45 if "来源" in name else 24 if name in ("场站", "字段", "原值", "新值或计算值") else 11 if name in ("年份", "月份", "类型", "级别") else 18)
+    if widths is None:
+        widths = []
+        for header in headers:
+            name = str(header)
+            widths.append(65 if "核对明细" in name else 56 if "说明" in name else 24 if "单元格" in name else 45 if "来源" in name else 24 if name in ("场站", "字段", "原值", "新值或计算值") else 11 if name in ("年份", "月份", "类型", "级别") else 18)
     columns = sheet.find(tag("cols")); columns.clear()
     for i, width in enumerate(widths, 1): ET.SubElement(columns, tag("col"), {"min": str(i), "max": str(i), "width": str(width), "customWidth": "1"})
     def display_units(text):
@@ -461,7 +504,7 @@ def _style_update_sheet(pkg, sheet, headers, values):
             lines = max([sum(max(1, math.ceil(display_units(line) / max(width - 2, 1))) for line in str(v if v is not None else "").split("\n")) for v, width in zip(data, widths)] + [1])
             row.set("ht", str(min(409, max(24, 15 * lines + 6)))); row.set("customHeight", "1")
     merges = ET.Element(tag("mergeCells"), {"count": "3"})
-    for n in (1, 2, 3): ET.SubElement(merges, tag("mergeCell"), {"ref": f"A{n}:{col(max(2, len(headers)))}{n}"})
+    for n in (1, 2, 3): ET.SubElement(merges, tag("mergeCell"), {"ref": f"A{n}:{col(max(2, min(len(headers), 9)))}{n}"})
     # autoFilter precedes mergeCells in the worksheet content model.
     sheet.append(merges)
 

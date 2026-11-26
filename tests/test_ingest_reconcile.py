@@ -248,6 +248,25 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(result['records'][0]['values'][6], 10)
         self.assertTrue(any(x.get('field_index') == 6 for x in result['issues']))
 
+    def test_tenfold_capacity_requires_matching_history_and_physical_evidence(self):
+        old = [record(month=month) for month in (1, 2)]
+        for row in old:
+            row['values'][6], row['values'][20] = 100, 15000
+        new = record(month=3, source='new.xlsx')
+        new['values'][6], new['values'][20] = 10, 15000
+        new['values'][4] = '另一报道地区'
+        new['capacity_unit_label'] = 'MW'
+        new['source_cells'] = {'6': 'F10'}
+        result = merge_records(old, [new])
+        self.assertEqual(result['records'][-1]['values'][6], 100)
+        change = next(c for c in result['changes'] if c['kind'] == 'capacity_unit_corrected')
+        self.assertEqual((change['before'], change['after'], change['source_cell']), (10, 100, 'F10'))
+        self.assertEqual(new['values'][6], 10)
+        # Insufficient history or a physically plausible small capacity remains unchanged.
+        self.assertEqual(merge_records(old[:1], [new])['records'][-1]['values'][6], 10)
+        new['values'][20] = 1000
+        self.assertEqual(merge_records(old, [new])['records'][-1]['values'][6], 10)
+
     def test_financial_identity_collision_quarantined(self):
         old = record('测试甲'); new = record('测试乙', source='new.xlsx')
         for j in [20, 21, 22, 32, 33, 34, 59, 60, 61]:
@@ -297,6 +316,26 @@ class ReconciliationTests(unittest.TestCase):
         result = reconcile_records([r])
         self.assertEqual(result['records'][0]['values'][60:62], [10, 50])
         self.assertFalse(result['changes'])
+
+    def test_audit_distinguishes_fee_and_quantity_discrepancies_with_original_price(self):
+        from benchmark.reporting import RECONCILIATION_HEADERS, reconciliation_rows
+
+        fee = record()
+        fee['values'][20] = fee['values'][59] = 100
+        fee['values'][22], fee['values'][60], fee['values'][61] = 30000, 300, 10000
+        qty = record('测试乙')
+        qty['values'][20], qty['values'][59] = 100, 300
+        qty['values'][22] = qty['values'][61] = 30000
+        qty['values'][60] = 300
+        reviews = reconcile_records([fee, qty])
+        first, second = [dict(zip(RECONCILIATION_HEADERS, r)) for r in reconciliation_rows(reviews['records'])]
+        self.assertEqual(first['量差额（MWh）'], 0)
+        self.assertEqual(first['费差额（元）'], -20000)
+        self.assertIn('支持分项费用和', first['原价交叉验证及处理'])
+        self.assertEqual(second['量差额（MWh）'], 200)
+        self.assertEqual(second['费差额（元）'], 0)
+        self.assertIn('支持分项电量和', second['原价交叉验证及处理'])
+        self.assertFalse(reviews['changes'])
 
 
 if __name__ == '__main__':

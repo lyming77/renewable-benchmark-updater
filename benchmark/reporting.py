@@ -17,7 +17,49 @@ _LABELS = {
 }
 _KINDS = {"added_record": "新增记录", "filled_empty": "补充空值",
           "overwritten_conflict": "按新值更新", "verified_summary_price": "核实后修正均价",
-          "normalized_format": "统一日期格式"}
+          "normalized_format": "统一日期格式", "capacity_unit_corrected": "核实后换算容量"}
+
+
+RECONCILIATION_HEADERS = [
+    "Sheet2行", "月份", "集团", "场站",
+    "实时电量（MWh）", "月末调整量（MWh）", "跨月调整量（MWh）", "其他已列物理量（MWh）",
+    "报送总量（MWh）", "已列分项量和（MWh）", "量差额（MWh）", "总量核验",
+    "报送总费（元）", "已列分项费和（元）", "费差额（元）", "总费核验",
+    "核验前均价（元/MWh）", "报送总费÷总量（元/MWh）", "价差额（元/MWh）", "表内均价（元/MWh）",
+    "原价交叉验证及处理", "未确认电量项", "未确认费用项", "明细来源",
+]
+
+
+def reconciliation_rows(records):
+    from .ingest import EXTRA_HEADERS, HEADERS, is_number
+    from .reconcile import INDEPENDENT_QUANTITY_FIELDS
+
+    def names(fields):
+        return "、".join(HEADERS[i] if i < len(HEADERS) else EXTRA_HEADERS[i] for i in fields)
+
+    for row, record in enumerate(records, 5):
+        review = record.get("reconciliation")
+        if review is None:
+            continue
+        v = record["values"]
+        independent = [v[i] for i in INDEPENDENT_QUANTITY_FIELDS if is_number(v[i])]
+        original, implied = review["reported_price"], review["expected_price"]
+        price_delta = original - implied if is_number(original) and implied is not None else None
+        price_notes = [review["price_evidence"], review["quantity_scope_note"]]
+        if review["price_corrected"]:
+            price_notes.append("已按已验证的总费÷总量重算均价")
+        yield [
+            row, record["month"], record["company"], v[2] or v[3],
+            v[20], v[29], v[56], round(sum(independent), 8) if independent else None,
+            v[59], review["known_quantity_sum"], _audit_difference(review["quantity_difference"]), review["quantity_status"],
+            v[61], review["known_fee_sum"], _audit_difference(review["fee_difference"]), review["fee_status"],
+            original, round(implied, 8) if implied is not None else None, _audit_difference(price_delta), v[60],
+            "；".join(filter(None, price_notes)), names(review["quantity_missing"]), names(review["fee_missing"]), v[0],
+        ]
+
+
+def _audit_difference(value):
+    return round(value, 8) if value is not None else None
 
 
 def _text(value):
